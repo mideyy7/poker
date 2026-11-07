@@ -6,8 +6,15 @@ from game_state import GameStateView
 from player_action import PlayerAction
 
 from pk_equity import equity
-from pk_eval import cards_to_ints
-from pk_opp import Stats, replay
+from pk_eval import cards_to_ints, category, evaluate_ints
+from pk_opp import (
+    DECAY,
+    PRIORS,
+    SOLVER_BB_VS_LIMP,
+    Stats,
+    replay,
+    size_bucket,
+)
 from pk_ranges import (
     VS_RANDOM,
     class_of,
@@ -22,7 +29,14 @@ from pk_ranges import (
 # out of / in position (crude, but better than assuming showdown).
 REALISE_OOP = 0.85
 REALISE_IP = 0.95
-TIME_BUDGET = 2.0  # seconds per decision, far under the 10 s limit
+TIME_BUDGET = 1.0  # seconds of sampling per decision; the limit is 10 s
+
+# Improvements from strong.md, each switchable so it can be gated alone.
+ALL_FEATURES = ("decay", "showdown", "sizes", "open2", "raise_term",
+                "loss_limit", "adaptive")
+# open2 (item 4) is off: the gate showed it gives up a limp-and-value-bet
+# exploit vs bots that fold preflop but call postflop (nit, -70 bb/100).
+DEFAULT_FEATURES = tuple(f for f in ALL_FEATURES if f != "open2")
 
 
 class Model:
@@ -35,15 +49,22 @@ class Model:
     their actions, with fold equity from their observed fold rate.
     """
 
-    def __init__(self, samples: int = 1200):
+    def __init__(self, samples: int = 1200, features=DEFAULT_FEATURES):
         self.hand = []
         self.player_id = None
         self.hole = []
         self.history = []
         self.samples = samples
-        self.stats = Stats()
+        self.features = {f: f in features for f in ALL_FEATURES}
+        priors = {k: dict(v) for k, v in PRIORS.items()}
+        if self.features["open2"]:
+            priors["bb_vs_limp"] = dict(SOLVER_BB_VS_LIMP)
+        self.stats = Stats(decay=DECAY if self.features["decay"] else 1.0,
+                           priors=priors)
         self.start_stack = 500
         self.errors = 0  # decisions that fell back to check/fold
+        self.results = {}  # team -> [hands, sum, sum of squares] (chips)
+        self.cur_pot = 0
 
     # ------------------------------------------------------------------
     # Engine hooks
@@ -72,13 +93,44 @@ class Model:
                 return
             opp = 1 - self.player_id
             team = game_state.teams[opp]
-            events, _, _ = replay(
+            events, board, shown = replay(
                 self.history, game_state.button, game_state.small_blind,
                 game_state.big_blind, self.start_stack)
             self.stats.learn(team, opp, events)
             self.stats.seen_hand(team)
+            if self.features["showdown"] and opp in shown                     and len(board) == 5:
+                self._learn_showdown(team, opp, events, board, shown[opp])
+            if self.features["loss_limit"]:
+                self._track_result(team, game_state)
         except Exception:
             pass
+
+    def _learn_showdown(self, team, opp, events, board, hole):
+        """Item 2: was their big postflop bet or raise a bluff? Weak means
+        their hand did not beat the board's own category."""
+        big = [e for e in events if e.player == opp and e.street != "preflop"
+               and e.move in ("bet", "raise") and e.amount >= 0.6 * e.pot]
+        if not big:
+            return
+        mine = category(evaluate_ints(list(hole) + board))
+        weak = mine <= category(evaluate_ints(board))
+        self.stats.add(team, "sd_bigbet", "weak" if weak else "strong")
+
+    def _track_result(self, team, gs):
+        """Item 6: our running result vs this team; if we are losing
+        significantly, trust the population prior more (exploit less)."""
+        net = gs.stacks[self.player_id] - self.start_stack
+        r = self.results.setdefault(team, [0, 0.0, 0.0])
+        r[0] += 1
+        r[1] += net
+        r[2] += net * net
+        n = r[0]
+        if n < 150:
+            return
+        mean = r[1] / n
+        var = max(r[2] / n - mean * mean, 1.0)
+        se = (var / n) ** 0.5
+        self.stats.weight[team] = 4.0 if mean + 2 * se < 0 else 1.0
 
     # ------------------------------------------------------------------
     # Helpers
@@ -127,6 +179,7 @@ class Model:
 
     def _decide(self, gs):
         self.deadline = time.perf_counter() + TIME_BUDGET
+        self.cur_pot = gs.pot
         n = gs.num_players
         self.start_stack = max(1, (sum(gs.stacks) + gs.pot) // n)
         if n != 2:
@@ -180,9 +233,21 @@ class Model:
             if e.situation == "post_first":
                 if e.move == "bet":
                     keep = f["bet"]
-                    if e.amount > e.pot:  # overbet: stronger
+                    top = 0.0
+                    if self.features["sizes"]:
+                        # Item 3: larger buckets hold the stronger hands.
+                        fs = self.stats.freqs(team, "post_first_sized")
+                        bucket = size_bucket(e.amount, e.pot)
+                        bigger = {"s": ("bet_m", "bet_l"), "m": ("bet_l",),
+                                  "l": ()}[bucket]
+                        top = sum(fs[k] for k in bigger)
+                        keep = top + fs["bet_" + bucket]
+                    elif e.amount > e.pot:  # overbet: stronger
                         keep *= 0.8
-                    combos = narrow_combos(combos, b, keep, floor=0.2)
+                    floor = self._bluff_floor(team, keep, e) or 0.2
+                    combos = narrow_combos(combos, b, keep, floor=floor,
+                                           passive_top=top,
+                                           passive_weight=0.3)
                 else:
                     combos = narrow_combos(combos, b, 1.0,
                                            passive_top=f["bet"] * 0.6,
@@ -193,10 +258,22 @@ class Model:
                                            floor=0.1, passive_top=f["raise"],
                                            passive_weight=0.5)
                 elif e.move == "raise":
-                    combos = narrow_combos(combos, b, f["raise"], floor=0.1)
+                    floor = self._bluff_floor(team, f["raise"], e) or 0.1
+                    combos = narrow_combos(combos, b, f["raise"], floor=floor)
             elif e.situation.startswith("vs_jam") and e.move == "call":
                 combos = narrow_combos(combos, b, f["call"], floor=0.05)
         return combos
+
+    def _bluff_floor(self, team, keep, e):
+        """Item 2: weight on hands outside the top `keep` so that their
+        share of a big bet's range equals the bluff share seen at
+        showdown. None when the feature is off or the bet is small."""
+        if not self.features["showdown"] or e.amount < 0.6 * e.pot:
+            return None
+        bluff = self.stats.freq(team, "sd_bigbet", "weak")
+        keep = min(max(keep, 0.02), 0.98)
+        floor = bluff * keep / ((1 - bluff) * (1 - keep))
+        return min(1.0, max(0.02, floor))
 
     # -- preflop --------------------------------------------------------
 
@@ -266,8 +343,6 @@ class Model:
 
         # Raise to 2.5bb, or a min-raise vs a bot that folds to raises.
         f_bb = stats.freqs(team, "bb_vs_raise")
-        size = 2 * bb if f_bb["fold"] > 0.6 else int(2.5 * bb)
-        cost = size - sb
         call_range = narrow_classes(full_range(), 1 - f_bb["fold"],
                                     passive_top=f_bb["raise"] + f_bb["jam"],
                                     passive_weight=0.35)
@@ -275,12 +350,22 @@ class Model:
         reraise_range = narrow_classes(full_range(),
                                        max(f_bb["raise"] + f_bb["jam"], 0.04),
                                        floor=0.02)
-        ev_raise = (
-            f_bb["fold"] * pot
-            + f_bb["call"] * (eq_called * 2 * size * REALISE_IP - cost)
-            + (f_bb["raise"] + f_bb["jam"])
-            * (call_jam_ev(reraise_range, size) - cost)
-        )
+
+        def open_ev(size):
+            cost = size - sb
+            return (
+                f_bb["fold"] * pot
+                + f_bb["call"] * (eq_called * 2 * size * REALISE_IP - cost)
+                + (f_bb["raise"] + f_bb["jam"])
+                * (call_jam_ev(reraise_range, size) - cost)
+            )
+
+        if self.features["open2"]:
+            # Item 4: let the EV choose between a 2bb and a 2.5bb open.
+            size = max((2 * bb, int(2.5 * bb)), key=open_ev)
+        else:
+            size = 2 * bb if f_bb["fold"] > 0.6 else int(2.5 * bb)
+        ev_raise = open_ev(size)
 
         # Limp.
         f_l = stats.freqs(team, "bb_vs_limp")
@@ -342,12 +427,15 @@ class Model:
     # -- postflop -------------------------------------------------------
 
     def _eq(self, board, combos, rng, samples=None):
-        return equity(self.hole, board, combos, samples or self.samples, rng,
-                      self.deadline)
+        n = samples or self.samples
+        if self.features["adaptive"] and self.cur_pot >= 200:
+            n = int(n * 1.5)  # item 7: big pots deserve accurate equity
+        return equity(self.hole, board, combos, n, rng, self.deadline)
 
     def _postflop(self, gs, me, opp, team, board, combos):
         rng = self._rng(gs)
         pot = gs.pot
+        self.cur_pot = pot
         call = gs.call_amount
         behind = gs.stacks[me]
         eff = gs.effective_stack(me)
@@ -403,10 +491,29 @@ class Model:
             b = min(max(b, gs.min_raise_to), gs.max_raise_to)
             ratio = b / max(pot, 1)
             fp = min(0.97, fold0 * (ratio / 0.66) ** 0.35)
-            cont = narrow_combos(combos, board, max(1 - fp, 0.05), floor=0.05)
-            eq_c = self._eq(board, cont, rng, samples=self.samples // 2 + 100)
             called_add = min(b, gs.stacks[opp])
-            ev = fp * pot + (1 - fp) * (eq_c * (pot + b + called_add) - b)
+            if self.features["raise_term"] and b < eff:
+                # Item 5: they may raise; we then call or fold, whichever
+                # is better vs their raising range (as if all-in).
+                fr = min(f["raise"], 1 - fp)
+                fc = 1 - fp - fr
+                cont = narrow_combos(combos, board, max(1 - fp, 0.05),
+                                     floor=0.05, passive_top=fr,
+                                     passive_weight=0.3)
+                eq_c = self._eq(board, cont, rng,
+                                samples=self.samples // 2 + 100)
+                raisers = narrow_combos(combos, board, max(fr, 0.03),
+                                        floor=0.05)
+                eq_r = self._eq(board, raisers, rng, samples=300)
+                vs_raise = max(-b, eq_r * (pot + 2 * eff) - eff)
+                ev = (fp * pot + fc * (eq_c * (pot + b + called_add) - b)
+                      + fr * vs_raise)
+            else:
+                cont = narrow_combos(combos, board, max(1 - fp, 0.05),
+                                     floor=0.05)
+                eq_c = self._eq(board, cont, rng,
+                                samples=self.samples // 2 + 100)
+                ev = fp * pot + (1 - fp) * (eq_c * (pot + b + called_add) - b)
             if ev > best_ev + 0.02 * pot:
                 best, best_ev = b, ev
         if best is not None:

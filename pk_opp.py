@@ -27,8 +27,17 @@ PRIORS = {
     # Postflop, nothing to call / facing a bet.
     "post_first": {"check": 0.55, "bet": 0.45},
     "post_facing": {"fold": 0.40, "call": 0.45, "raise": 0.15},
+    # Item 3: first bet postflop split by size bucket.
+    "post_first_sized": {"check": 0.55, "bet_s": 0.10, "bet_m": 0.25,
+                         "bet_l": 0.10},
+    # Item 2: big bets that reached showdown, weak hand (bluff) or not.
+    "sd_bigbet": {"weak": 0.25, "strong": 0.75},
 }
+
+# Item 4: big blind vs limp prior from 25bb solver charts.
+SOLVER_BB_VS_LIMP = {"check": 0.57, "raise": 0.37, "jam": 0.06}
 PRIOR_WEIGHT = 10.0
+DECAY = 0.985  # item 1: memory of about 67 observations per situation
 
 
 class Event:
@@ -152,14 +161,26 @@ def replay(actions, button, small_blind, big_blind, start_stack,
 
 
 class Stats:
-    """Per-team move counts per situation. Plain dicts only."""
+    """Per-team move counts per situation. Plain dicts only.
 
-    def __init__(self):
+    decay: old evidence fades by this factor per new observation in the
+    same situation (1.0 = never forget). priors: situation -> move -> prior
+    frequency (defaults to PRIORS). weight: per-team multiplier on the
+    prior weight (more = trust the prior more, exploit less).
+    """
+
+    def __init__(self, decay=1.0, priors=None):
         self.counts = {}  # team -> situation -> move -> count
         self.hands = {}  # team -> hands seen
+        self.decay = decay
+        self.priors = {k: dict(v) for k, v in (priors or PRIORS).items()}
+        self.weight = {}  # team -> prior weight multiplier
 
     def add(self, team, situation, move):
         sit = self.counts.setdefault(team, {}).setdefault(situation, {})
+        if self.decay < 1.0:
+            for m in sit:
+                sit[m] *= self.decay
         sit[move] = sit.get(move, 0) + 1
 
     def seen_hand(self, team):
@@ -169,17 +190,32 @@ class Stats:
         return sum(self.counts.get(team, {}).get(situation, {}).values())
 
     def freq(self, team, situation, move):
-        prior = PRIORS[situation]
+        prior = self.priors[situation]
         sit = self.counts.get(team, {}).get(situation, {})
         total = sum(sit.values())
-        return ((sit.get(move, 0) + PRIOR_WEIGHT * prior.get(move, 0.0))
-                / (total + PRIOR_WEIGHT))
+        w = PRIOR_WEIGHT * self.weight.get(team, 1.0)
+        return (sit.get(move, 0) + w * prior.get(move, 0.0)) / (total + w)
 
     def freqs(self, team, situation):
-        return {m: self.freq(team, situation, m) for m in PRIORS[situation]}
+        return {m: self.freq(team, situation, m)
+                for m in self.priors[situation]}
 
     def learn(self, team, player, events):
         for e in events:
-            if e.player == player and e.situation in PRIORS \
-                    and e.move in PRIORS[e.situation]:
+            if e.player == player and e.situation in self.priors                     and e.move in self.priors[e.situation]:
                 self.add(team, e.situation, e.move)
+            # Bet sizes when first to bet postflop (item 3).
+            if e.player == player and e.situation == "post_first":
+                self.add(team, "post_first_sized",
+                         "check" if e.move != "bet"
+                         else "bet_" + size_bucket(e.amount, e.pot))
+
+
+def size_bucket(amount, pot):
+    """s: under 0.4 pot, l: 0.9 pot or more, m: between."""
+    ratio = amount / max(pot, 1)
+    if ratio < 0.4:
+        return "s"
+    if ratio >= 0.9:
+        return "l"
+    return "m"

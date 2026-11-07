@@ -78,11 +78,93 @@ class Aggro(_Bot):
         return PlayerAction.fold(self.player_id)
 
 
+class CheckRaiser(_Bot):
+    """Calls preflop; postflop checks, then raises pot over any bet."""
+
+    def run(self, actions, gs):
+        if gs.street == "preflop":
+            if gs.call_amount <= 3 * gs.big_blind:
+                return PlayerAction.call(self.player_id)
+            return self._check_or_fold(gs)
+        if gs.call_amount == 0:
+            return PlayerAction.call(self.player_id)
+        if gs.can_raise:
+            return self._raise_to(gs, gs.current_bet + gs.pot)
+        return PlayerAction.call(self.player_id)
+
+
+class RiverBluffer(_Bot):
+    """Calls down small bets; on the river bets/raises 1.5x pot with
+    anything. Punishes bots that fold too much to big river bets."""
+
+    def run(self, actions, gs):
+        if gs.street == "river" and gs.can_raise:
+            return self._raise_to(gs, gs.current_bet + int(1.5 * gs.pot))
+        if gs.call_amount <= gs.pot // 2 + gs.big_blind:
+            return PlayerAction.call(self.player_id)
+        return self._check_or_fold(gs)
+
+
+class MinBettor(_Bot):
+    """Plays any two; min-bets/min-raises whenever it can, calls the rest
+    unless facing more than half its stack."""
+
+    def run(self, actions, gs):
+        if gs.can_raise and gs.bets[self.player_id] < 4 * gs.big_blind:
+            return self._raise_to(gs, gs.min_raise_to)
+        if gs.call_amount * 2 <= gs.stacks[self.player_id]:
+            return PlayerAction.call(self.player_id)
+        return self._check_or_fold(gs)
+
+
+class ThreeBetJammer(_Bot):
+    """Limps the SB; as BB jams over any open with the top ~45% of
+    hands, else folds. Postflop: pair+ calls, otherwise check/fold."""
+
+    def run(self, actions, gs):
+        strong = _strength(self.hand) >= 27
+        if gs.street == "preflop":
+            if gs.call_amount > 0 and gs.current_bet > gs.big_blind:
+                if strong:
+                    return self._raise_to(gs, gs.max_raise_to)
+                return PlayerAction.fold(self.player_id)
+            return PlayerAction.call(self.player_id)
+        if evaluate(self.hand + list(gs.board))[0] >= 1:
+            return PlayerAction.call(self.player_id)
+        return self._check_or_fold(gs)
+
+
+class StyleSwitch(_Bot):
+    """Plays like Nit for its first 150 hands, then like Aggro: tests
+    whether opponent stats adapt after a change of style."""
+
+    def __init__(self, seed=None):
+        super().__init__(seed)
+        self.hands = 0
+        self.nit = Nit()
+        self.aggro = Aggro()
+
+    def seed(self, hand, player_id):
+        super().seed(hand, player_id)
+        self.hands += 1
+        for b in (self.nit, self.aggro):
+            b.seed(hand, player_id)
+
+    def run(self, actions, gs):
+        bot = self.nit if self.hands <= 150 else self.aggro
+        return bot.run(actions, gs)
+
+
 SPARRING = {
     "minraise": MinRaiser,
     "limpcall": LimpCaller,
     "nit": Nit,
     "aggro": Aggro,
+    "checkraise": CheckRaiser,
+    "riverbluff": RiverBluffer,
+    "minbet": MinBettor,
+    "jam3bet": ThreeBetJammer,
+    "switch": StyleSwitch,
 }
 
 
